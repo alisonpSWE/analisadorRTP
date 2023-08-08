@@ -1,4 +1,4 @@
-// stats.c - contadores de perda, reordenacao e duplicata
+// stats.c - contadores de perda, reordenacao, duplicata e jitter
 // nao inclui nada de winsock, so recebe o cabecalho ja parseado
 
 #include "stats.h"
@@ -40,13 +40,12 @@ void stats_init(struct rtp_stats *s, uint32_t clock_rate)
 }
 
 // =================================================
-// update por pacote: perda/duplicata/reordenacao pela seq
+// update por pacote: jitter (RFC 3550) + perda/duplicata/reordenacao pela seq
 // =================================================
 void stats_update(struct rtp_stats *s, const struct rtp_header *h, uint32_t arrival)
 {
     int16_t dif;
-
-    (void)arrival;   // TODO: usar pra calcular o jitter
+    int32_t trans;
 
     // primeiro pacote
     if (!s->iniciado) {
@@ -57,6 +56,7 @@ void stats_update(struct rtp_stats *s, const struct rtp_header *h, uint32_t arri
         s->cycles = 0;
         s->recebidos = 1;
         bit_set(s->seen, h->seq);
+        s->transit_ant = (int32_t)(arrival - h->ts);   // so guarda a referencia, ainda nao da pra calcular jitter
         return;
     }
 
@@ -66,6 +66,20 @@ void stats_update(struct rtp_stats *s, const struct rtp_header *h, uint32_t arri
     }
 
     s->recebidos++;
+
+    // jitter
+    // RFC 3550 6.4.1. se arrival < ts a subtracao da a volta em 2^32, tudo bem,
+    // so a diferenca entre dois trans seguidos importa
+    trans = (int32_t)(arrival - h->ts);
+    {
+        int32_t jit = trans - s->transit_ant;
+        if (jit < 0)
+            jit = -jit;
+        s->jitter += ((double)jit - s->jitter) / 16.0;   // media movel de ganho 1/16
+        if (s->jitter > s->jitter_max)
+            s->jitter_max = s->jitter;
+    }
+    s->transit_ant = trans;
 
     // seq e perda
     dif = (int16_t)(h->seq - s->max_seq);   // int16_t pra virada de 65535 pra 0 dar +1 e nao -65535
@@ -107,7 +121,7 @@ void stats_update(struct rtp_stats *s, const struct rtp_header *h, uint32_t arri
 
 
 // =================================================
-// calculos derivados: pacotes esperados e perdidos
+// calculos derivados: pacotes esperados, perdidos e jitter em ms
 // =================================================
 unsigned long stats_esperados(const struct rtp_stats *s)
 {
@@ -123,15 +137,12 @@ long stats_perdidos(const struct rtp_stats *s)
     return (long)esperados - (long)unicos;
 }
 
-// TODO: jitter (RFC 3550 6.4.1), por enquanto so pra nao quebrar o link
 double stats_jitter_ms(const struct rtp_stats *s)
 {
-    (void)s;
-    return 0.0;
+    return (s->jitter / s->clock_rate) * 1000.0;
 }
 
 double stats_jitter_max_ms(const struct rtp_stats *s)
 {
-    (void)s;
-    return 0.0;
+    return (s->jitter_max / s->clock_rate) * 1000.0;
 }
