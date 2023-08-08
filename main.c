@@ -1,5 +1,10 @@
 // analisadorRTP
-// por enquanto so escuta uma porta udp e imprime o cabecalho dos pacotes que chegam
+// escuta uma porta udp, decodifica cabecalho RTP e conta perda/reordenacao/jitter
+// menu no terminal: escolhe a porta, o clock e manda capturar
+
+// =================================================
+// includes, defines e estado global
+// =================================================
 
 // winsock2 antes de windows.h, senao vem o winsock 1 junto e sockaddr_in briga
 #include <winsock2.h>
@@ -9,11 +14,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 
 #include "rtp.h"
+#include "stats.h"
 
 #define PORTA_PADRAO 5004
+#define CLOCK_PADRAO 90000
 #define TAM_BUFFER   65536   // datagrama maximo, no winsock buffer curto faz recvfrom falhar em vez de truncar
+
+static volatile sig_atomic_t g_rodando = 1;
 
 // usei isso pra debugar no comeco
 void dump_bytes(const unsigned char *p, int n)
@@ -25,14 +35,80 @@ void dump_bytes(const unsigned char *p, int n)
 }
 
 // =================================================
-// captura: socket UDP e loop recvfrom -> rtp_parse -> print
+// sinal: Ctrl+C derruba o loop de captura
 // =================================================
-static void capturar(int porta)
+static void on_sigint(int sinal) {
+    (void)sinal;
+    g_rodando = 0;
+}
+
+// =================================================
+// leitura do teclado: scanf + limpeza do buffer
+// =================================================
+// o scanf deixa o que sobrou digitado no buffer, entao jogo fora ate a quebra de linha
+static void limpar_entrada(void)
+{
+    int c;
+    while ((c = getchar()) != '\n' && c != EOF)
+        ;
+}
+
+// fica pedindo ate o usuario digitar um numero de verdade
+static int ler_inteiro(const char *mensagem)
+{
+    int valor;
+
+    while (1) {
+        printf("%s", mensagem);
+        fflush(stdout);
+
+        if (scanf("%d", &valor) == 1) {
+            limpar_entrada();
+            return valor;
+        }
+
+        limpar_entrada();
+        printf("valor invalido, digite so numeros.\n");
+    }
+}
+
+// =================================================
+// menu na tela
+// =================================================
+static void mostrar_menu(int porta, int clock_rate)
+{
+    printf("\n");
+    printf("=========================\n");
+    printf(" ANALISADOR RTP\n");
+    printf("=========================\n");
+    printf("porta atual...: %d\n", porta);
+    printf("clock atual...: %d Hz\n", clock_rate);
+    printf("-------------------------\n");
+    printf("1 - mudar a porta\n");
+    printf("2 - mudar o clock\n");
+    printf("3 - comecar a capturar\n");
+    printf("4 - sair\n");
+    printf("-------------------------\n");
+}
+
+// =================================================
+// captura: socket UDP, loop recvfrom -> rtp_parse -> stats_update
+// =================================================
+static void capturar(int porta, int clock_rate)
 {
     SOCKET s;
     struct sockaddr_in local;
     static unsigned char buf[TAM_BUFFER];   // static pra nao estourar a pilha
+    struct rtp_stats stats;
+    LARGE_INTEGER qpc_freq;
+    unsigned long descartados = 0;
+    DWORD timeout_ms = 500;
 
+    stats_init(&stats, (uint32_t)clock_rate);
+
+    QueryPerformanceFrequency(&qpc_freq);   // substituto do gettimeofday, que nao existe aqui
+
+    // socket
     s = socket(AF_INET, SOCK_DGRAM, 0);
     if (s == INVALID_SOCKET) {
         printf("erro: socket() falhou (%d)\n", WSAGetLastError());
@@ -50,46 +126,78 @@ static void capturar(int porta)
         return;
     }
 
-    printf("escutando UDP na porta %d\n", porta);
+    // no windows o recvfrom bloqueado nao acorda com ctrl+c, entao timeout de 500ms
+    // pro loop conseguir olhar g_rodando. aqui SO_RCVTIMEO e um DWORD em ms, nao timeval
+    if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
+                   (const char *)&timeout_ms, sizeof timeout_ms) == SOCKET_ERROR) {
+        printf("erro: setsockopt(SO_RCVTIMEO) falhou (%d)\n", WSAGetLastError());
+        closesocket(s);
+        return;
+    }
+
+    g_rodando = 1;
+    signal(SIGINT, on_sigint);
+
+    printf("\nescutando UDP na porta %d - Ctrl+C para parar\n", porta);
     fflush(stdout);
 
-    // TODO: sair do loop com ctrl+c em vez de fechar a janela no berro
-    while (1) {
+    while (g_rodando) {
         struct sockaddr_in remoto;
         int tam = sizeof remoto;
-        struct rtp_header h;
-        int n, r;
+        int n;
 
         n = recvfrom(s, (char *)buf, TAM_BUFFER, 0,
                      (struct sockaddr *)&remoto, &tam);
         if (n == SOCKET_ERROR) {
-            printf("erro: recvfrom falhou (%d)\n", WSAGetLastError());
+            int erro = WSAGetLastError();
+            if (erro == WSAETIMEDOUT)
+                continue;   // nao e erro, so a deixa pra rechecar g_rodando
+            printf("erro: recvfrom falhou (%d)\n", erro);
             break;
         }
 
-        r = rtp_parse(buf, (size_t)n, &h);
+        {
+            LARGE_INTEGER agora;
+            uint32_t arrival;
+            struct rtp_header h;
+            int r;
 
-        // inet_ntoa porque inet_ntop nao ta declarado neste mingw
-        if (r == 0) {
-            printf("%s:%d V=%u P=%u X=%u CC=%u M=%u PT=%u seq=%u ts=%lu ssrc=0x%08lX len=%d\n",
-                   inet_ntoa(remoto.sin_addr), ntohs(remoto.sin_port),
-                   h.version, h.padding, h.extension, h.cc, h.marker, h.pt,
-                   h.seq, (unsigned long)h.ts, (unsigned long)h.ssrc, n);
-        } else {
-            printf("%s:%d descartado (%d bytes): %s\n",
-                   inet_ntoa(remoto.sin_addr), ntohs(remoto.sin_port),
-                   n, rtp_erro_str(r));
+            // pega a hora antes de decodificar, quanto mais perto da chegada melhor pro jitter
+            QueryPerformanceCounter(&agora);
+            arrival = (uint32_t)(((double)agora.QuadPart / (double)qpc_freq.QuadPart)
+                                  * clock_rate);
+
+            // parse do cabecalho
+            r = rtp_parse(buf, (size_t)n, &h);
+
+            // estatisticas
+            if (r == 0)
+                stats_update(&stats, &h, arrival);
+            else
+                descartados++;
         }
-        fflush(stdout);
     }
 
     closesocket(s);
+    signal(SIGINT, SIG_DFL);   // fora da captura, Ctrl+C volta a fechar o programa
 
-    // TODO: contar perda, duplicata e jitter e imprimir um resumo no final
+    // TODO: resumo decente, com duracao da captura e perda em %
+    printf("\nrecebidos: %lu\n", stats.recebidos);
+    printf("perdidos: %ld\n", stats_perdidos(&stats));
+    printf("fora de ordem: %lu\n", stats.fora_de_ordem);
+    printf("duplicados: %lu\n", stats.duplicados);
+    printf("descartados: %lu\n", descartados);
+    printf("jitter: %.3fms\n", stats_jitter_ms(&stats));
 }
 
+// =================================================
+// main: liga o winsock e roda o loop do menu
+// =================================================
 int main(void)
 {
+    int porta = PORTA_PADRAO;
+    int clock_rate = CLOCK_PADRAO;
+    int opcao = 0;
     WSADATA wsa;
 
     // winsock
@@ -98,7 +206,30 @@ int main(void)
         return 1;
     }
 
-    capturar(PORTA_PADRAO);
+    while (opcao != 4) {
+        mostrar_menu(porta, clock_rate);
+        opcao = ler_inteiro("escolha uma opcao: ");
+
+        if (opcao == 1) {
+            int nova = ler_inteiro("digite a porta (1 a 65535): ");
+            if (nova < 1 || nova > 65535)
+                printf("porta invalida, continua %d.\n", porta);
+            else
+                porta = nova;
+        } else if (opcao == 2) {
+            int novo = ler_inteiro("digite o clock em Hz (90000 video, 8000 audio): ");
+            if (novo < 1)
+                printf("clock invalido, continua %d.\n", clock_rate);
+            else
+                clock_rate = novo;
+        } else if (opcao == 3) {
+            capturar(porta, clock_rate);
+        } else if (opcao == 4) {
+            printf("fim.\n");
+        } else {
+            printf("opcao inexistente, tente de novo.\n");
+        }
+    }
 
     WSACleanup();
     return 0;
