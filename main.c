@@ -1,6 +1,7 @@
 // analisadorRTP
 // escuta uma porta udp, decodifica cabecalho RTP e conta perda/reordenacao/jitter
-// menu no terminal: escolhe a porta, o clock e manda capturar
+// menu no terminal: escolhe a porta, o clock, o modo verboso e manda capturar
+// durante a captura, ctrl+c encerra e imprime o resumo
 
 // =================================================
 // includes, defines e estado global
@@ -75,7 +76,7 @@ static int ler_inteiro(const char *mensagem)
 // =================================================
 // menu na tela
 // =================================================
-static void mostrar_menu(int porta, int clock_rate)
+static void mostrar_menu(int porta, int clock_rate, int verboso)
 {
     printf("\n");
     printf("=========================\n");
@@ -83,24 +84,26 @@ static void mostrar_menu(int porta, int clock_rate)
     printf("=========================\n");
     printf("porta atual...: %d\n", porta);
     printf("clock atual...: %d Hz\n", clock_rate);
+    printf("modo verboso..: %s\n", verboso ? "ligado" : "desligado");
     printf("-------------------------\n");
     printf("1 - mudar a porta\n");
     printf("2 - mudar o clock\n");
-    printf("3 - comecar a capturar\n");
-    printf("4 - sair\n");
+    printf("3 - ligar/desligar o modo verboso\n");
+    printf("4 - comecar a capturar\n");
+    printf("5 - sair\n");
     printf("-------------------------\n");
 }
 
 // =================================================
-// captura: socket UDP, loop recvfrom -> rtp_parse -> stats_update
+// captura: socket UDP, loop recvfrom -> rtp_parse -> stats_update -> print
 // =================================================
-static void capturar(int porta, int clock_rate)
+static void capturar(int porta, int clock_rate, int verboso)
 {
     SOCKET s;
     struct sockaddr_in local;
     static unsigned char buf[TAM_BUFFER];   // static pra nao estourar a pilha
     struct rtp_stats stats;
-    LARGE_INTEGER qpc_freq;
+    LARGE_INTEGER qpc_freq, qpc_inicio, qpc_fim;
     unsigned long descartados = 0;
     DWORD timeout_ms = 500;
 
@@ -138,8 +141,11 @@ static void capturar(int porta, int clock_rate)
     g_rodando = 1;
     signal(SIGINT, on_sigint);
 
-    printf("\nescutando UDP na porta %d - Ctrl+C para parar\n", porta);
+    printf("\nescutando UDP na porta %d (verbose=%s) - Ctrl+C para parar\n",
+           porta, verboso ? "sim" : "nao");
     fflush(stdout);
+
+    QueryPerformanceCounter(&qpc_inicio);
 
     while (g_rodando) {
         struct sockaddr_in remoto;
@@ -175,19 +181,64 @@ static void capturar(int porta, int clock_rate)
                 stats_update(&stats, &h, arrival);
             else
                 descartados++;
+
+            if (verboso) {
+                // inet_ntoa porque inet_ntop nao ta declarado neste mingw
+                if (r == 0) {
+                    printf("%s:%d V=%u P=%u X=%u CC=%u M=%u PT=%u "
+                           "seq=%u ts=%lu ssrc=0x%08lX len=%d"
+                           " | total=%lu perdidos=%ld fora_ordem=%lu"
+                           " dup=%lu tarde=%lu ignorados=%lu"
+                           " jitter=%.3fms jitter_max=%.3fms\n",
+                           inet_ntoa(remoto.sin_addr), ntohs(remoto.sin_port),
+                           h.version, h.padding, h.extension, h.cc, h.marker, h.pt,
+                           h.seq, (unsigned long)h.ts, (unsigned long)h.ssrc, n,
+                           stats.recebidos, stats_perdidos(&stats),
+                           stats.fora_de_ordem, stats.duplicados,
+                           stats.tarde_demais, stats.ignorados,
+                           stats_jitter_ms(&stats), stats_jitter_max_ms(&stats));
+                } else {
+                    printf("%s:%d descartado (%d bytes): %s\n",
+                           inet_ntoa(remoto.sin_addr), ntohs(remoto.sin_port),
+                           n, rtp_erro_str(r));
+                }
+                fflush(stdout);
+            }
         }
     }
+
+    QueryPerformanceCounter(&qpc_fim);
 
     closesocket(s);
     signal(SIGINT, SIG_DFL);   // fora da captura, Ctrl+C volta a fechar o programa
 
-    // TODO: resumo decente, com duracao da captura e perda em %
-    printf("\nrecebidos: %lu\n", stats.recebidos);
-    printf("perdidos: %ld\n", stats_perdidos(&stats));
-    printf("fora de ordem: %lu\n", stats.fora_de_ordem);
-    printf("duplicados: %lu\n", stats.duplicados);
-    printf("descartados: %lu\n", descartados);
-    printf("jitter: %.3fms\n", stats_jitter_ms(&stats));
+    // =================================================
+    // resumo final: totais, perda %, jitter e duracao
+    // =================================================
+    {
+        unsigned long esperados = stats_esperados(&stats);
+        long lost = stats_perdidos(&stats);
+        double perc = (esperados > 0) ? (100.0 * (double)lost / (double)esperados) : 0.0;
+        double secs = (double)(qpc_fim.QuadPart - qpc_inicio.QuadPart) / (double)qpc_freq.QuadPart;
+
+        printf("\n=========================\n");
+        printf(" resumo\n");
+        printf("=========================\n");
+        printf("duracao: %.2fs\n", secs);
+        if (stats.iniciado)
+            printf("ssrc: 0x%08lX\n", (unsigned long)stats.ssrc);
+        printf("Pacotes recebidos: %lu\n", stats.recebidos);
+        printf("esperados: %lu\n", esperados);
+        printf("lost: %ld (%.2f%%)\n", lost, perc);
+        printf("Fora de ordem: %lu\n", stats.fora_de_ordem);
+        printf("duplicados: %lu\n", stats.duplicados);
+        printf("tarde demais (janela %d): %lu\n", STATS_WIN_BITS, stats.tarde_demais);
+        printf("ignorados (outro ssrc): %lu\n", stats.ignorados);
+        printf("descartados: %lu\n", descartados);
+        printf("jitter medio: %.3fms\n", stats_jitter_ms(&stats));
+        printf("jitter max: %.3fms\n", stats_jitter_max_ms(&stats));
+        printf("-----\n");
+    }
 }
 
 // =================================================
@@ -197,6 +248,7 @@ int main(void)
 {
     int porta = PORTA_PADRAO;
     int clock_rate = CLOCK_PADRAO;
+    int verboso = 0;
     int opcao = 0;
     WSADATA wsa;
 
@@ -206,8 +258,8 @@ int main(void)
         return 1;
     }
 
-    while (opcao != 4) {
-        mostrar_menu(porta, clock_rate);
+    while (opcao != 5) {
+        mostrar_menu(porta, clock_rate, verboso);
         opcao = ler_inteiro("escolha uma opcao: ");
 
         if (opcao == 1) {
@@ -223,8 +275,11 @@ int main(void)
             else
                 clock_rate = novo;
         } else if (opcao == 3) {
-            capturar(porta, clock_rate);
+            verboso = !verboso;
+            printf("modo verboso agora esta %s.\n", verboso ? "ligado" : "desligado");
         } else if (opcao == 4) {
+            capturar(porta, clock_rate, verboso);
+        } else if (opcao == 5) {
             printf("fim.\n");
         } else {
             printf("opcao inexistente, tente de novo.\n");
